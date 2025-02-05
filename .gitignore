@@ -1,0 +1,7 @@
+__pycache__
+*/__pycache__
+*/line.vtp
+*/line.vtk
+.data/*
+utils_test.py
+Results_Segnn_SteadyState

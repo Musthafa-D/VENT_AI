@@ -1,0 +1,32 @@
+name: SEGNN_project
+channels:
+  - rusty1s
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8.12
+  - cudatoolkit=11.3
+  - torchaudio==0.10.1
+  - pytorch==1.10.1
+  - torchvision==0.11.2
+  - pytorch-geometric=2.0.3
+  - pytorch-mutex=1.0
+  - pytorch-scatter=2.0.9
+  - pytorch-sparse=0.6.12
+  - pytorch-spline-conv=1.2.1
+  - pytorch-lightning # it installed the 2.0.0 version
+  - numpy
+  - scikit-learn
+  - plotly
+  - matplotlib
+  - ipython
+  - jupyter
+  - spyder 
+  - networkx==3.1
+  - pip
+  - pip:
+    - e3nn==0.5.1
+    - wandb==0.12.9
+    - protobuf==3.19.3
+prefix: D:\miniconda3\envs\SEGNN_project
