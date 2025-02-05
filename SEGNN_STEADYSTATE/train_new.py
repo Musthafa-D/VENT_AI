@@ -263,6 +263,8 @@ def train(model, loader, opt, loss_func, dev, log = True, mask = False):
         # edge_index = knn_graph(sample.pos, args.neighbours, sample.batch)
         
         sample.edge_index = edge_index
+        print(sample.edge_index)
+        print(sample.edge_index.shape)
         
         # computes relative positions for every node pair
         edge_relativePos = (torch.index_select(sample.pos, 0, edge_index[1]) - torch.index_select(sample.pos, 0, edge_index[0]))

@@ -45,7 +45,7 @@ EARLY_STOP = 10
 
 ### MARK: DATASET
 
-DATASET = 2
+DATASET = 4
 
 if DATASET == 1:
     NFLUID_PROBES = 125
@@ -84,7 +84,7 @@ if DATASET == 4:
     NFRAME = 1 
 
     NSIM = 100
-    DATADIR = os.path.join("../.data/Dataset_100sims_7G2N") # generated data
+    DATADIR = os.path.join("../.data/Dataset_100sims_7G2N_healthy") # generated data
     BATCH_SIZE = 1
 
 if DATASET == 5:

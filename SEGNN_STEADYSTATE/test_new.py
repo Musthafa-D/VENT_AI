@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import gc
 
 from plotly.subplots import make_subplots
+
 from segnn.segnn import SEGNN
 from e3nn.o3 import Irreps, spherical_harmonics
 from segnn.balanced_irreps import BalancedIrreps, WeightBalancedIrreps
@@ -22,13 +23,17 @@ from Utility_functions import print_3D_graph, manual_print_3D_graph, Graph_datas
 
 import os
 import params
-
+from utils import plot_gnn_explainer, plot_gradcam
+import networkx as nx
+from torch_geometric.utils import k_hop_subgraph, to_networkx, degree
+from torch_geometric.data import Data
+from interpret import ModelWrapper
 
 def main():
     print('DATADIR', params.DATADIR)
     print('NSIM', params.NSIM)
     print('BATCH_SIZE', params.BATCH_SIZE)
-
+    
     print('torch.__version__', torch.__version__)
     print('torch.cuda.is_available()', torch.cuda.is_available())
     
@@ -78,7 +83,6 @@ def main():
     print(count_parameters(model))
     
     model.to(dev)
-    print(model)
     model.eval()
     
     gc.collect()
@@ -152,43 +156,86 @@ def main():
     
     fluid_nodes = torch.tensor(2)
     
-    # # s is the sample graph
+    # s is the sample graph
+    for idx, s in enumerate(loader):
     # for s in tqdm(loader): 
     
     
-    #     # edge_index = knn_graph(s.pos, neighbours, s.batch)
-    #     edge_index = graph_connectivity
-    #     # print(edge_index)
-    #     s.edge_index = edge_index
-    #     # print(len(s.pos))
-    #     edge_relativePos = (torch.index_select(s.pos, 0, edge_index[1]) - torch.index_select(s.pos, 0, edge_index[0]))
-    #     edge_relativeDist = torch.norm(edge_relativePos, dim = -1, keepdim = True) 
-    #     edge_attr = torch.cat([edge_relativeDist, edge_relativePos], dim = -1) 
+        # edge_index = knn_graph(s.pos, neighbours, s.batch)
+        edge_index = graph_connectivity
+        # print(edge_index)
+        s.edge_index = edge_index
+        # print(len(s.pos))
+        edge_relativePos = (torch.index_select(s.pos, 0, edge_index[1]) - torch.index_select(s.pos, 0, edge_index[0]))
+        edge_relativeDist = torch.norm(edge_relativePos, dim = -1, keepdim = True) 
+        edge_attr = torch.cat([edge_relativeDist, edge_relativePos], dim = -1) 
     
-    #     s.edge_attr = edge_attr
-    #     #s.node_attr = s.pos
-    #     #print(s.node_attr)
+        s.edge_attr = edge_attr
+        #s.node_attr = s.pos
+        #print(s.node_attr)
         
-    #     s = s.to(dev)
-    #     with torch.no_grad():
+        s = s.to(dev)
+        # Function to visualize the entire graph
+        def visualize_entire_graph(data):
+            G = to_networkx(data, to_undirected=True)
+            plt.figure(figsize=(12, 12))
+            nx.draw(G, with_labels=True, node_color='blue', edge_color='gray')
+            plt.title("Entire Graph")
+            plt.show()
+        
+        # Function to print node degrees
+        def print_node_degrees(edge_index):
+            degrees = degree(edge_index[0], dtype=torch.long)
+            for node, deg in enumerate(degrees):
+                print(f"Node {node}: Degree {deg.item()}")
+        
+        # Visualize subgraphs
+        def visualize_subgraph(edge_index, node_idx, num_hops):
+            subset, sub_edge_index, _, _ = k_hop_subgraph(node_idx, num_hops, edge_index, relabel_nodes=True)
+            G = to_networkx(Data(edge_index=sub_edge_index), to_undirected=True)
+            plt.figure(figsize=(8, 8))
+            pos = nx.spring_layout(G, seed = 1234)
+            nx.draw(G, pos, with_labels=True, node_color='yellow', edge_color='gray')
+            plt.title(f"Subgraph for node {node_idx} with {num_hops} hops")
+            plt.show()
+        
+        if idx == len(loader)-1:
+            node_idx = 0  # Set your desired node index
+            num_hops = 3
+            print("Custom Dataset:")
+            visualize_entire_graph(s)
             
-    #         if hasattr(s, "mask"):
-    #             mask = s.mask
-    #         else:
-    #             mask = torch.ones(s.x.shape[0], dtype=torch.bool)
+            print("Node degrees in custom dataset:")
+            print_node_degrees(s.edge_index)
+            
+            # Example visualization
+            visualize_subgraph(s.edge_index, node_idx=node_idx, num_hops=num_hops)
+            
+            plot_gnn_explainer(model, s, node_idx, num_hops)
+            model_g = ModelWrapper(model)
+            plot_gradcam(model_g, s, node_idx, num_hops)
+            # explain_node_prediction(model, s, dev, 200, node_idx, idx, 0)
+        with torch.no_grad():
+            
+            if hasattr(s, "mask"):
+                mask = s.mask
+            else:
+                mask = torch.ones(s.x.shape[0], dtype=torch.bool)
                 
-    #         out = model(s)
-    #         #print(out)
-    #         loss_val = loss_func(out[mask], s.y[mask])
-    #         #print(loss_val)
+            # out = model(s)
+            out = model(s.x, s.edge_index, pos=s.pos, edge_attr=s.edge_attr, 
+                         node_attr=s.node_attr, batch=s.batch, y=s.y)
+            
+            #print(out)
+            loss_val = loss_func(out[mask], s.y[mask])
+            #print(loss_val)
             
         
-    #     outputs.append(out)
-    #     loss.append(loss_val.item())
-    #     # print(loss)
-    #     # print(len(loss))  
+        outputs.append(out)
+        loss.append(loss_val.item())
+        # print(loss)
+        # print(len(loss))
     
-    # save = True
     save = True
     
     if save:
@@ -202,7 +249,7 @@ def main():
     
     """Test set plots"""
     loadloss = np.load('loss.npy')
-
+    
     plt.figure(figsize=(16,8))
     
     plt.plot(range(len(loadloss)), loadloss, marker='o', markersize=5,
@@ -248,11 +295,6 @@ def main():
         print(pred[0]) # press, vel_x, vel_y, vel_z (=6.3379e-02)
     
         print(test_graph.node_attr)
-    
-    # remember that to plot the graphs ignoring the ground truth velocities and pressures, you have
-    # to plot pred[sample.mask], and not simply the "pred" tensor (which contains predictions on all nodes,
-    # included the ones that were masked out during training because true values were used in the input, and 
-    # that were not taken care of by backpropagation)
     
     """Ground truth"""
     # edges = knn_graph(test_graph.pos, neighbours)
@@ -342,7 +384,7 @@ def main():
             print(f"On node {row}: {diff.tolist()}")
     
     print(" ")
-    print(f"Graph has: {len(pred)} rows")
+    print(f"Graph has: {len(pred)} nodes")
     
     """Loss analysis"""
     import glob
@@ -395,14 +437,14 @@ def main():
     true_mis = true_mis[:len(loss_vel)]
     
     # print(len(true_mis))
-    # print(true_mis)
+    print(true_mis)
     
     loss_vel = loss_vel[:(len(loss_vel)-1)]
     loss_press = loss_press[:(len(loss_press)-1)]
     true_mis = true_mis[:(len(true_mis)-1)]
     
     # print(len(loss_val))
-
+    
     plt.figure(figsize=(15,10))
     
     color = np.arange(len(loss_vel))
@@ -421,7 +463,7 @@ def main():
     plt.show()
     
     plt.figure(figsize=(15,10))
-
+    
     color = np.arange(len(loss_press))
     plt.scatter(true_mis, loss_press, marker = ".", c = color, cmap = 'hsv', s = 10)
     plt.colorbar()

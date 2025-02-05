@@ -367,10 +367,10 @@ def GradCAM_get_explanation_node(gradcam_explainer,
     x.requires_grad = True
 
     if label is None:
-        pred = custom__forward_pass_g(model, x, y, edge_index, pos, edge_attr, node_attr, batch)[0][node_idx, :].reshape(1, -1)
+        pred = custom__forward_pass(model, x, y, edge_index, pos, edge_attr, node_attr, batch)[0][node_idx, :].reshape(1, -1)
         y[node_idx] = pred.argmax(dim=1).item()
     else: # Transform node_idx's label if provided by user
-        pred, loss = custom__forward_pass_g(model, x, y, edge_index, pos, edge_attr, node_attr, batch)
+        pred, loss = custom__forward_pass(model, x, y, edge_index, pos, edge_attr, node_attr, batch)
         y[node_idx] = label
 
     walk_steps, _ = custom_extract_step(model, x, edge_index, pos, edge_attr, node_attr, batch, y, detach=True, split_fc=True)
@@ -392,11 +392,11 @@ def GradCAM_get_explanation_node(gradcam_explainer,
 
         for l in range(gradcam_explainer.L):
             # Compute gradients for this layer ahead of time:
-            gradients = custom_grad_by_layer(l, model)
+            gradients = gradcam_explainer.__grad_by_layer(l)
 
             for i in range(subgraph_N): # Over all subgraph nodes
                 n = subgraph_nodes[i]
-                avg_gcam[i] += custom_get_gCAM_layer(walk_steps, l, model, N, n, gradients)
+                avg_gcam[i] += gradcam_explainer.__get_gCAM_layer(walk_steps, l, n, gradients)
 
         avg_gcam /= gradcam_explainer.L # Apply average
 
@@ -406,10 +406,10 @@ def GradCAM_get_explanation_node(gradcam_explainer,
         assert layer < len(walk_steps), "Layer must be an index of convolutional layers"
 
         gcam = torch.zeros(subgraph_N)
-        gradients = custom_grad_by_layer(layer, model)
+        gradients = gradcam_explainer.__grad_by_layer(layer)
         for i in range(subgraph_N):
             n = subgraph_nodes[i]
-            gcam[i] += custom_get_gCAM_layer(walk_steps, layer, model, N, n, gradients)#[0]
+            gcam[i] += gradcam_explainer.__get_gCAM_layer(walk_steps, layer, n, gradients)#[0]
 
         exp.node_imp = gcam
 
@@ -465,146 +465,109 @@ def custom__forward_pass(model, x, label, edge_index, pos, edge_attr, node_attr,
 
     return pred, loss
 
-def custom__forward_pass_g(model, x, label, edge_index, pos, edge_attr, node_attr, batch):
-    x.requires_grad = True # Enforce that x needs gradient
-
-    # Forward pass:
-    model.eval()
-    pred, _ = model(x, edge_index, pos=pos, edge_attr=edge_attr, 
-                 node_attr=node_attr, batch=batch, y=label)
-    
-    criterion = F.cross_entropy
-
-    loss = criterion(pred, label)
-    loss.backward() # Propagate loss backward through network
-
-    return pred, loss
-
 
 def custom_extract_step(model, x: torch.Tensor, edge_index: torch.Tensor, pos, edge_attr, node_attr, batch, y, detach: bool = True, split_fc: bool = False):
-    '''Gets information about every layer in the graph'''
-    model.eval()
+    '''Gets information about every layer in the graph
+    Args:
 
-    with torch.no_grad():
-        out, intermediate_outputs = model(x, edge_index, pos=pos, edge_attr=edge_attr, node_attr=node_attr, batch=batch, y=y)
-
-    print(f"Extracted {len(intermediate_outputs)} intermediate outputs")  # Debug print
-    for i, intermediate_output in enumerate(intermediate_outputs):
-        print(f"Intermediate output {i}, shape: {intermediate_output.shape}")  # Debug print
+        forward_kwargs (tuple, optional): Additional arguments to model forward call (other than x and edge_index)
+            (default: :obj:`None`)
+    '''
 
     layer_extractor = []
-    for i, intermediate_output in enumerate(intermediate_outputs):
-        if detach:
-            layer_extractor.append((model.model.layers[i], intermediate_output.detach()))
-        else:
-            layer_extractor.append((model.model.layers[i], intermediate_output))
+    hooks = []
 
-    print(f"Extracted {len(layer_extractor)} layers")  # Debug print
+    def register_hook(module: torch.nn.Module):
+        if not list(module.children()) or isinstance(module, MessagePassing):
+            hooks.append(module.register_forward_hook(forward_hook))
+
+    def forward_hook(module: torch.nn.Module, input: Tuple[torch.Tensor], output: torch.Tensor):
+        # input contains x and edge_index
+        if detach:
+            layer_extractor.append((module, input[0].clone().detach(), output.clone().detach()))
+        else:
+            layer_extractor.append((module, input[0], output))
+
+    # --- register hooks ---
+    model.apply(register_hook)
+
+    # ADDED: OWEN QUEEN --------------
+    _ = model(x, edge_index, pos=pos, edge_attr=edge_attr, 
+                 node_attr=node_attr, batch=batch, y=y)
+    # --------------------------------
+    # Remove hooks:
+    for hook in hooks:
+        hook.remove()
+
+    # --- divide layer sets ---
+
+    # print('Layer extractor', [layer_extractor[i][0] for i in range(len(layer_extractor))])
 
     walk_steps = []
     fc_steps = []
-
+    pool_flag = False
+    step = {'input': None, 'module': [], 'output': None}
     for layer in layer_extractor:
-        step = {'input': layer[1], 'module': [layer[0]], 'output': layer[1]}
         if isinstance(layer[0], MessagePassing):
-            walk_steps.append(step)
-        else:
-            fc_steps.append(step)
+            if step['module']: # Append step that had previously been building
+                walk_steps.append(step)
 
-    print(f"Walk steps: {len(walk_steps)}, FC steps: {len(fc_steps)}")  # Debug print
+            step = {'input': layer[1], 'module': [], 'output': None}
+
+        elif isinstance(layer[0], GNNPool):
+            pool_flag = True
+            if step['module']:
+                walk_steps.append(step)
+
+            # Putting in GNNPool
+            step = {'input': layer[1], 'module': [], 'output': None}
+
+        elif isinstance(layer[0], torch.nn.Linear):
+            if step['module']:
+                if isinstance(step['module'][0], MessagePassing):
+                    walk_steps.append(step) # Append MessagePassing layer to walk_steps
+                else: # Always append Linear layers to fc_steps
+                    fc_steps.append(step)
+
+            step = {'input': layer[1], 'module': [], 'output': None}
+
+        # Also appends non-trainable layers to step (not modifying input):
+        step['module'].append(layer[0])
+        step['output'] = layer[2]
+
+    if step['module']:
+        if isinstance(step['module'][0], MessagePassing):
+            walk_steps.append(step)
+        else: # Append anything to FC that is not MessagePassing at its origin
+            # Still supports sequential layers
+            fc_steps.append(step)
+        # print('layer', layer[0])
+        # if isinstance(layer[0], MessagePassing) or isinstance(layer[0], GNNPool):
+        #     if isinstance(layer[0], GNNPool):
+        #         pool_flag = True
+        #     if step['module'] and step['input'] is not None:
+        #         walk_steps.append(step)
+        #     step = {'input': layer[1], 'module': [], 'output': None}
+        # if pool_flag and split_fc and isinstance(layer[0], nn.Linear):
+        #     if step['module']:
+        #         fc_steps.append(step)
+        #     step = {'input': layer[1], 'module': [], 'output': None}
+        # step['module'].append(layer[0])
+        # step['output'] = layer[2]
+
+    for walk_step in walk_steps:
+        if hasattr(walk_step['module'][0], 'nn') and walk_step['module'][0].nn is not None:
+            # We don't allow any outside nn during message flow process in GINs
+            walk_step['module'] = [walk_step['module'][0]]
+        elif hasattr(walk_step['module'][0], 'lin') and walk_step['module'][0].lin is not None:
+            walk_step['module'] = [walk_step['module'][0]]
+
+    # print('Walk steps', [walk_steps[i]['module'] for i in range(len(walk_steps))])
+    # print('fc steps', [fc_steps[i]['module'] for i in range(len(fc_steps))])
 
     return walk_steps, fc_steps
-
-def custom_grad_by_layer(layer, model):
-    module_at_layer = list(model.model.layers)[layer]
-
-    # Check if the module has a weight attribute
-    if hasattr(module_at_layer, 'weight') and module_at_layer.weight.grad is not None:
-        grad = module_at_layer.weight.grad
-    elif hasattr(module_at_layer, 'bias') and module_at_layer.bias.grad is not None:
-        grad = module_at_layer.bias.grad
-    else:
-        grad = torch.zeros(1)  # Fallback tensor
-
-    print(f"Layer {layer}, grad shape: {grad.shape}")  # Debug print
-
-    if grad is not None and grad.dim() > 0:
-        if grad.dim() > 1:
-            return grad.mean(dim=1)
-        else:
-            return grad.mean()  # Handle the case where grad is 1D or 0D
-    else:
-        return torch.zeros(1)  # Fallback tensor
-
-def custom_get_gCAM_layer(walk_steps, layer, model, N, node_idx = None, gradients = None):
-    # Gets Grad CAM for one layer
-    if gradients is None:
-        gradients = custom_grad_by_layer(layer, model)
-
-    print(f"Processing layer {layer} with {len(walk_steps)} walk steps")  # Debug print
-
-    if node_idx is None: # Need to compute for entire graph:
-        node_explanations = []
-        for n in range(N):
-            node_explanations.append(custom_exp_node(n, walk_steps, layer, gradients))
-
-        return node_explanations
-
-    # Return for only one node:
-    return custom_exp_node(node_idx, walk_steps, layer, gradients)
-
-def custom_exp_node(node_idx, walk_steps, layer, gradients):
-    '''
-    Gets explanation for one node
-    Assumes ReLU activation after each convolutional layer
-    TODO: Fix activation function assumption
-    '''
-    try:
-        # Activations for node n
-        F_l_n = F.relu(walk_steps[layer]['output'][node_idx,:]).detach()
-        print(f"Layer {layer}, Node {node_idx}, F_l_n shape: {F_l_n.shape}")  # Debug print
-        print(f"Gradients shape: {gradients.shape}")  # Debug print
-
-        if gradients.dim() == 0 or F_l_n.dim() == 0:
-            L_cam_n = torch.tensor(0.0)  # Fallback value if any tensor is 0D
-        else:
-            L_cam_n = F.relu(torch.matmul(gradients, F_l_n))  # Combine gradients and activations
-
-        return L_cam_n.item()
-    except Exception as e:
-        print(f"Error in custom_exp_node: {e}")
-        raise e
 
 
 class GNNPool(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        
-
-import torch
-import torch.nn as nn
-
-class ModelWrapper(nn.Module):
-    def __init__(self, model):
-        super(ModelWrapper, self).__init__()
-        self.model = model
-        self.intermediate_outputs = []
-
-    def forward(self, x, edge_index, **kwargs):
-        self.intermediate_outputs = []
-
-        def hook_fn(module, input, output):
-            if isinstance(module, MessagePassing):
-                self.intermediate_outputs.append(output)
-
-        hooks = []
-        for layer in self.model.modules():
-            if isinstance(layer, MessagePassing):
-                hooks.append(layer.register_forward_hook(hook_fn))
-
-        out = self.model(x, edge_index, **kwargs)
-
-        for hook in hooks:
-            hook.remove()
-
-        return out, self.intermediate_outputs
